@@ -751,8 +751,83 @@ impl<const BITS: usize, const LIMBS: usize> From<&Uint<BITS, LIMBS>> for f64 {
     #[inline]
     #[allow(clippy::cast_precision_loss)] // Documented
     fn from(value: &Uint<BITS, LIMBS>) -> Self {
-        let (bits, exponent) = value.most_significant_bits();
-        (bits as Self) * (exponent as Self).exp2()
+        Self::from_bits(value.to_f64_bits())
+    }
+}
+
+impl<const BITS: usize, const LIMBS: usize> Uint<BITS, LIMBS> {
+    // Returns the IEEE-754 binary64 bit pattern (u64) for this unsigned big int.
+    pub fn to_f64_bits(self) -> u64 {
+        // Special case zero.
+        if self.is_zero() {
+            return 0;
+        }
+
+        // Normalize: move the leading 1 into the top bit position of the fixed-width integer.
+        let n = self.leading_zeros() as usize; // 0 <= n < BITS since value != 0
+        let y = self << n;
+
+        // Exponent field with the "minus one so mantissa can overflow into it" trick:
+        // e = (bias + (bitlen-1)) - 1 = (1023 + (BITS-1-n)) - 1 = (1021 + BITS) - n
+        let mut e = (1021u64 + BITS as u64) - n as u64;
+
+        // If the exponent already exceeds the representable range, saturate to +inf.
+        // (This cannot happen for u32/u64/u128, but can for larger BITS.)
+        if e >= 0x7FF {
+            return 0x7FF0_0000_0000_0000;
+        }
+
+        // Extract 53 significant bits (including the hidden bit) into `a`.
+        // After this, `a` is a 53-bit value in a u64, "bit 53 still intact".
+        let a: u64 = if BITS >= 53 {
+            // Bring the top 53 bits down to the bottom.
+            let shifted = y >> (BITS - 53);
+            shifted.limbs[0]
+        } else {
+            // Fit the entire value (<= 53 bits) and shift it up so its MSB sits at bit 52.
+            // Since y fits in BITS bits, its low 64 limb contains the entire value.
+            let lo = y.limbs[0];
+            lo << (53 - BITS)
+        };
+
+        // Build `b` (64-bit) that carries guard/sticky info for branchless rounding:
+        // - b >> 63 = guard bit (the bit right below the 53 kept bits)
+        // - b > (1<<63) when sticky bits exist (any dropped bits below guard are 1),
+        //   so ties vs. "round up" are distinguished by b values.
+        let b: u64 = if BITS > 53 {
+            let r = BITS - 53; // number of dropped (insignificant) bits
+
+            // tail = the dropped bits (lowest r bits of y)
+            let one = Uint::<BITS, LIMBS>::ONE;
+            let tail_mask = (one << r) - one;
+            let tail = y & tail_mask;
+
+            // guard = bit r-1 (top of the dropped region)
+            let guard: u64 = if r > 0 {
+                ((tail >> (r - 1)).limbs[0] & 1) as u64
+            } else {
+                0
+            };
+
+            // sticky = any 1s below the guard bit?
+            let sticky: bool = if r > 1 {
+                let low_mask = (one << (r - 1)) - one;
+                !(tail & low_mask).is_zero()
+            } else {
+                false
+            };
+
+            (guard << 63) | (sticky as u64)
+        } else {
+            0
+        };
+
+        // Tie-to-even, branchless:
+        // Add one when we need to round up; break ties to even.
+        let m = a + ((b - ((b >> 63) & !a)) >> 63);
+
+        // Combine. Use '+' (not '|') so an overflowing mantissa carry increments the exponent.
+        ((e << 52) + m)
     }
 }
 
